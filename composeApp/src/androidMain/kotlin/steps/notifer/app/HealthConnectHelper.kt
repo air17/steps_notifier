@@ -165,13 +165,9 @@ object HealthConnectHelper {
 
     private fun todayRange(): Pair<Instant, Instant> {
         val zone = ZoneId.systemDefault()
-        val nowZoned = ZonedDateTime.now(zone)
-        val startOfDay = nowZoned.toLocalDate().atStartOfDay(zone).toInstant()
-        val endTime = if (nowZoned.toInstant().isAfter(startOfDay)) {
-            nowZoned.toInstant()
-        } else {
-            startOfDay.plusSeconds(1)
-        }
+        val now = Instant.now()
+        val startOfDay = now.atZone(zone).toLocalDate().atStartOfDay(zone).toInstant()
+        val endTime = maxOf(now, startOfDay.plusSeconds(1))
         return startOfDay to endTime
     }
 }
