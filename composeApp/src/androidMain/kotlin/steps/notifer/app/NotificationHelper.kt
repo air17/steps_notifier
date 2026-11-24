@@ -1,4 +1,10 @@
 package steps.notifer.app
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.util.Log
+import androidx.core.content.ContextCompat
+import java.time.LocalDate
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -19,8 +25,16 @@ object NotificationHelper {
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(channel)
     }
-    fun show(context: Context, title: String, body: String, showSkip: Boolean = true) {
+    fun show(context: Context, title: String, body: String, showSkip: Boolean = true,
+             session: String? = null, day: LocalDate? = null) {
         createChannel(context)
+        val nm = context.getSystemService(NotificationManager::class.java)
+        if ((Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context,
+                Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) ||
+            !nm.areNotificationsEnabled() || nm.getNotificationChannel(CHANNEL_ID)?.importance == NotificationManager.IMPORTANCE_NONE) {
+            Log.w("StepNotification", "Notification permission, app notifications or channel disabled")
+            return
+        }
         // Tapping the notification opens MainActivity.
         // FLAG_IMMUTABLE is required on API 23+; FLAG_UPDATE_CURRENT reuses an existing PendingIntent.
         val openIntent = Intent(context, MainActivity::class.java).apply {
@@ -39,17 +53,24 @@ object NotificationHelper {
             .setAutoCancel(true)
             // Attach the tap-to-open intent to the notification body
             .setContentIntent(openPending)
-        if (showSkip) {
-            // "Skip" action cancels the retry loop and schedules tomorrow's check
-            val skipIntent = Intent(context, SkipReceiver::class.java)
+        if (showSkip && session != null && day != null) {
+            // Action is part of PendingIntent identity. A stale Skip cannot affect a new goal/day.
+            val skipIntent = Intent(context, SkipReceiver::class.java).apply {
+                action = "steps.notifer.app.SKIP.$session.$day"
+                putExtra(WorkScheduler.KEY_SESSION, session)
+                putExtra(WorkScheduler.KEY_DAY, day.toEpochDay())
+            }
             val skipPending = PendingIntent.getBroadcast(
                 context, 0, skipIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
             builder.addAction(0, "Skip", skipPending)
         }
-        val nm = context.getSystemService(NotificationManager::class.java)
-        nm.notify(NOTIFICATION_ID, builder.build())
+        try {
+            nm.notify(NOTIFICATION_ID, builder.build())
+        } catch (e: SecurityException) {
+            Log.w("StepNotification", "Permission changed before notification could be posted", e)
+        }
     }
     fun cancel(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java)

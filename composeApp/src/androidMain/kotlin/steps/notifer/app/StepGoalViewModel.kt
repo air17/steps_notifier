@@ -1,109 +1,95 @@
 package steps.notifer.app
+
 import android.app.Application
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+
+internal data class JournalSettings(val goal: GoalData?, val correction: Long)
+internal enum class Setting { Goal, Correction }
+internal data class SaveStatus(val field: Setting, val busy: Boolean, val message: String)
+
 class StepGoalViewModel(application: Application) : AndroidViewModel(application) {
     private val context get() = getApplication<Application>()
-    private val _hour = MutableStateFlow(18)
-    val hour: StateFlow<Int> = _hour
-    private val _minute = MutableStateFlow(0)
-    val minute: StateFlow<Int> = _minute
-    private val _stepThreshold = MutableStateFlow("10000")
-    val stepThreshold: StateFlow<String> = _stepThreshold
-    private val _saved = MutableStateFlow(false)
-    val saved: StateFlow<Boolean> = _saved
-    // Raw HC reading without correction applied (used for display of raw+corrected separately)
-    private val _rawSteps = MutableStateFlow<Long?>(null)
-    // Effective steps after applying correction (what is shown on screen and used in workers)
-    private val _currentSteps = MutableStateFlow<Long?>(null)
-    val currentSteps: StateFlow<Long?> = _currentSteps
-    private val _stepsLoading = MutableStateFlow(false)
-    val stepsLoading: StateFlow<Boolean> = _stepsLoading
+    // These are persisted values, never editor drafts. Null until both reads finish.
+    internal val settings = combine(context.goalFlow(), context.stepsCorrectionFlow(), ::JournalSettings)
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    private val rawSteps = MutableStateFlow<Long?>(null)
+    val currentSteps = combine(rawSteps, settings) { raw, saved ->
+        if (raw != null && saved != null) correctedTotal(raw, saved.correction) else null
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    private val _stepsLoading = MutableStateFlow(true)
+    val stepsLoading = _stepsLoading.asStateFlow()
     private val _healthConnectStatus = MutableStateFlow(HealthConnectHelper.Status.AVAILABLE)
-    val healthConnectStatus: StateFlow<HealthConnectHelper.Status> = _healthConnectStatus
+    val healthConnectStatus = _healthConnectStatus.asStateFlow()
     private val _debugData = MutableStateFlow<String?>(null)
-    val debugData: StateFlow<String?> = _debugData
+    val debugData = _debugData.asStateFlow()
     private val _debugLoading = MutableStateFlow(false)
-    val debugLoading: StateFlow<Boolean> = _debugLoading
-    // Steps correction: positive adds, negative subtracts.
-    // Displayed as a signed integer string in the UI (e.g., "-150" or "0").
-    private val _stepsCorrection = MutableStateFlow("0")
-    val stepsCorrection: StateFlow<String> = _stepsCorrection
-    val currentGoal: StateFlow<GoalData?> = context.goalFlow()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
-    fun onHourChange(h: Int) { _hour.value = h }
-    fun onMinuteChange(m: Int) { _minute.value = m }
-    fun onStepThresholdChange(s: String) { _stepThreshold.value = s }
-    fun onStepsCorrectionChange(s: String) { _stepsCorrection.value = s }
-    fun saveAndSchedule() {
-        val steps = _stepThreshold.value.toIntOrNull() ?: return
+    val debugLoading = _debugLoading.asStateFlow()
+    private val _saveStatus = MutableStateFlow<SaveStatus?>(null)
+    internal val saveStatus = _saveStatus.asStateFlow()
+    private var refreshJob: Job? = null
+    private var reportJob: Job? = null
+
+    internal fun saveGoal(goal: GoalData) = save(Setting.Goal,
+        "Goal saved. Reminder scheduled.", "Could not confirm the reminder. Try saving the goal again."
+    ) { WorkScheduler.saveAndSchedule(context, goal) }
+
+    internal fun saveCorrection(value: Long) = save(Setting.Correction,
+        "Correction applied to today.", "Could not apply the correction. Try again."
+    ) { context.saveStepsCorrection(value) }
+
+    private fun save(field: Setting, success: String, failure: String, action: suspend () -> Unit) {
+        if (_saveStatus.value?.busy == true) return
+        _saveStatus.value = SaveStatus(field, true, "Saving…")
         viewModelScope.launch {
-            context.saveGoal(_hour.value, _minute.value, steps)
-            WorkScheduler.enqueueMainWorker(context, _hour.value, _minute.value)
-            _saved.value = true
-        }
-    }
-    /** Save the correction immediately when the user changes the field (on focus-loss or button). */
-    fun saveCorrection() {
-        val correction = _stepsCorrection.value.toLongOrNull() ?: return
-        viewModelScope.launch {
-            context.saveStepsCorrection(correction)
-            // Re-compute the effective steps with the new correction
-            val raw = _rawSteps.value
-            if (raw != null) _currentSteps.value = raw + correction
-        }
-    }
-    fun loadExisting() {
-        viewModelScope.launch {
-            val goal = context.goalFlow().firstOrNull()
-            if (goal != null) {
-                _hour.value = goal.hour
-                _minute.value = goal.minute
-                _stepThreshold.value = goal.steps.toString()
-                _saved.value = true
+            val message = try {
+                action()
+                success
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                Log.e("StepSettings", "Could not finish saving $field", e)
+                failure
             }
-            // Load persisted correction value
-            val correction = context.stepsCorrectionFlow().firstOrNull() ?: 0L
-            _stepsCorrection.value = correction.toString()
-            // Ensure the nightly correction worker is scheduled (idempotent via KEEP policy)
-            ensureCorrectionWorkerScheduled()
+            _saveStatus.value = SaveStatus(field, false, message)
         }
     }
+
+    internal fun clearFeedback() { if (_saveStatus.value?.busy != true) _saveStatus.value = null }
+
     fun refreshSteps() {
+        refreshJob?.cancel()
         val status = HealthConnectHelper.getSdkStatus(context)
         _healthConnectStatus.value = status
-        if (status != HealthConnectHelper.Status.AVAILABLE) return
-        viewModelScope.launch {
-            _stepsLoading.value = true
-            try {
-                val raw = HealthConnectHelper.getTodaySteps(context)
-                _rawSteps.value = raw
-                // Apply stored correction offset when displaying
-                val correction = context.stepsCorrectionFlow().firstOrNull() ?: 0L
-                _currentSteps.value = raw + correction
+        _stepsLoading.value = status == HealthConnectHelper.Status.AVAILABLE
+        rawSteps.value = null
+        if (!_stepsLoading.value) return
+        refreshJob = viewModelScope.launch {
+            rawSteps.value = try {
+                HealthConnectHelper.getTodaySteps(context)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
-                _currentSteps.value = null
-            } finally {
-                _stepsLoading.value = false
+                null
             }
+            _stepsLoading.value = false
         }
     }
+
     fun loadDebugData() {
-        if (_healthConnectStatus.value != HealthConnectHelper.Status.AVAILABLE) return
-        viewModelScope.launch {
-            _debugLoading.value = true
+        if (_debugLoading.value || _debugData.value != null) return
+        _debugLoading.value = true
+        reportJob = viewModelScope.launch {
             try {
-                val report = HealthConnectHelper.getDebugReport(context)
-                _debugData.value = report
-                // Also copy to clipboard automatically
-                copyToClipboard(report)
+                _debugData.value = HealthConnectHelper.getDebugReport(context)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (e: Exception) {
                 _debugData.value = "Error: ${e.message}"
             } finally {
@@ -111,20 +97,20 @@ class StepGoalViewModel(application: Application) : AndroidViewModel(application
             }
         }
     }
-    fun dismissDebug() { _debugData.value = null }
-    private fun copyToClipboard(text: String) {
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("HC Debug", text))
+    fun dismissDebug() {
+        reportJob?.cancel()
+        _debugData.value = null
+        _debugLoading.value = false
     }
-    /**
-     * Checks on a background thread whether the correction check worker is already enqueued.
-     * Schedules it if not. Called from loadExisting() which runs on every screen open.
-     */
-    private fun ensureCorrectionWorkerScheduled() {
+
+    fun repairSchedule() {
         viewModelScope.launch(Dispatchers.IO) {
-            // isCorrectionWorkerScheduled uses blocking .get() — must run on IO dispatcher
-            if (!WorkScheduler.isCorrectionWorkerScheduled(context)) {
-                WorkScheduler.enqueueCorrectionCheckWorker(context)
+            try {
+                WorkScheduler.repair(context)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                Log.e("StepSchedule", "Could not repair scheduled work", e)
             }
         }
     }

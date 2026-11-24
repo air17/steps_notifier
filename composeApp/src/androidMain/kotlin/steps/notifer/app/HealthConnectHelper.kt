@@ -39,44 +39,37 @@ object HealthConnectHelper {
         })
     }
 
-    /**
-     * Returns today's step total.
-     *
-     * Some apps (e.g. Samsung Health) write a single "daily summary" record that spans
-     * 00:00–23:59 with the live cumulative total. Health Connect's aggregate() interpolates
-     * such records proportionally to the elapsed fraction of the day, producing a lower
-     * (wrong) number. We detect these records (duration >= 20 h) and use their count directly.
-     *
-     * If no daily-summary record exists, we fall back to aggregate() which handles proper
-     * deduplication across multiple granular sources (e.g. the built-in Android pedometer).
-     */
     suspend fun getTodaySteps(context: Context): Long {
-        val client = HealthConnectClient.getOrCreate(context)
-        val (startOfDay, now) = todayRange()
-
-        val records = client.readRecords(
-            ReadRecordsRequest(
-                recordType = StepsRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
-            )
-        ).records
-
-        val dailySummaries = records.filter { r ->
-            Duration.between(r.startTime, r.endTime).toHours() >= 20
-        }
-        if (dailySummaries.isNotEmpty()) {
-            return dailySummaries.maxOf { r -> r.count }
-        }
-
-        // No daily-summary records: use aggregate for deduplication across granular sources
-        val result = client.aggregate(
-            AggregateRequest(
-                metrics = setOf(StepsRecord.COUNT_TOTAL),
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
-            )
-        )
-        return result[StepsRecord.COUNT_TOTAL] ?: 0L
+        val (start, now) = todayRange()
+        return readTotal(context, start, now) ?: 0L
     }
+
+    /** A missing aggregate means no measurement. Only live callers default it to zero. */
+    internal suspend fun readTotal(context: Context, start: Instant, end: Instant): Long? {
+        val client = HealthConnectClient.getOrCreate(context)
+        val range = TimeRangeFilter.between(start, end)
+        return pageSummaries(client, range, start, end) {
+            client.aggregate(AggregateRequest(
+                metrics = setOf(StepsRecord.COUNT_TOTAL), timeRangeFilter = range
+            ))[StepsRecord.COUNT_TOTAL]
+        }
+    }
+
+    private fun StepsRecord.isSummary(start: Instant, end: Instant): Boolean =
+        startTime >= start && startTime < end && Duration.between(startTime, endTime).toHours() >= 20
+
+    private suspend fun pageSummaries(
+        client: HealthConnectClient, range: TimeRangeFilter, start: Instant, end: Instant,
+        onRecords: (List<StepsRecord>) -> Unit = {}, aggregate: suspend () -> Long?,
+    ): Long? = pagedStepTotal(read = { token ->
+        val page = client.readRecords(ReadRecordsRequest(
+            recordType = StepsRecord::class, timeRangeFilter = range, pageToken = token
+        ))
+        onRecords(page.records)
+        // A running summary which started yesterday isn't today's live total.
+        val max = page.records.asSequence().filter { it.isSummary(start, end) }.maxOfOrNull { it.count }
+        SummaryPage(max, page.pageToken)
+    }, aggregate = aggregate)
 
     /** Full debug report copied to clipboard when the 🐛 button is pressed. */
     suspend fun getDebugReport(context: Context): String {
@@ -127,17 +120,12 @@ object HealthConnectHelper {
         sb.appendLine()
 
         // 3. Raw records
-        val records = client.readRecords(
-            ReadRecordsRequest(
-                recordType = StepsRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
-            )
-        ).records
+        val records = mutableListOf<StepsRecord>()
+        pageSummaries(client, TimeRangeFilter.between(startOfDay, now), startOfDay, now,
+            onRecords = { records.addAll(it) }, aggregate = { aggTotal })
         val rawSum = records.sumOf { r -> r.count }
 
-        val dailySummaries = records.filter { r ->
-            Duration.between(r.startTime, r.endTime).toHours() >= 20
-        }
+        val dailySummaries = records.filter { it.isSummary(startOfDay, now) }
         sb.appendLine("--- Raw Records (${records.size} total, sum=$rawSum) ---")
         sb.appendLine("Daily-summary records (>=20 h): ${dailySummaries.size}")
         if (dailySummaries.isNotEmpty()) {
@@ -154,7 +142,7 @@ object HealthConnectHelper {
             recs.sortedBy { r -> r.startTime }.forEach { r ->
                 val s = ZonedDateTime.ofInstant(r.startTime, tz).format(fmt)
                 val e = ZonedDateTime.ofInstant(r.endTime, tz).format(fmt)
-                val tag = if (Duration.between(r.startTime, r.endTime).toHours() >= 20)
+                val tag = if (r.isSummary(startOfDay, now))
                     " [DAILY SUMMARY]" else ""
                 sb.appendLine("    $s–$e : ${r.count}$tag")
             }
